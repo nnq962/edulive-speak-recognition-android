@@ -30,9 +30,10 @@ public class Whisper {
 
     public static final Action ACTION_TRANSCRIBE = Action.TRANSCRIBE;
     public static final Action ACTION_TRANSLATE = Action.TRANSLATE;
+    public static final Action ACTION_LIVE_TRANSCRIBE = Action.LIVE_TRANSCRIBE;
 
     private enum Action {
-        TRANSLATE, TRANSCRIBE
+        TRANSLATE, TRANSCRIBE, LIVE_TRANSCRIBE
     }
 
     private final AtomicBoolean mInProgress = new AtomicBoolean(false);
@@ -94,6 +95,13 @@ public class Whisper {
             Log.d(TAG, "Execution is already in progress...");
             return;
         }
+        
+        // For live transcription, we don't need to signal file transcription task
+        if (mAction == Action.LIVE_TRANSCRIBE) {
+            Log.d(TAG, "Live transcription mode started");
+            return;
+        }
+        
         taskLock.lock();
         try {
             taskAvailable = true;
@@ -180,10 +188,14 @@ public class Whisper {
     private void transcribeBufferLoop() {
         while (!Thread.currentThread().isInterrupted()) {
             float[] samples = readBuffer();
-            if (samples != null) {
+            if (samples != null && mInProgress.get() && mAction == Action.LIVE_TRANSCRIBE) {
                 synchronized (mWhisperEngine) {
-                    String result = mWhisperEngine.transcribeBuffer(samples);
-                    sendResult(result);
+                    if (mWhisperEngine.isInitialized()) {
+                        String result = mWhisperEngine.transcribeBuffer(samples);
+                        if (result != null && !result.trim().isEmpty()) {
+                            sendResult(result);
+                        }
+                    }
                 }
             }
         }

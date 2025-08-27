@@ -52,6 +52,7 @@ public class MainActivity extends AppCompatActivity {
     private Button btnRecord;
     private Button btnPlay;
     private Button btnTranscribe;
+    private Button btnLiveTranscribe;
 
     private Player mPlayer = null;
     private Recorder mRecorder = null;
@@ -65,6 +66,19 @@ public class MainActivity extends AppCompatActivity {
     private final boolean loopTesting = false;
     private final SharedResource transcriptionSync = new SharedResource();
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private boolean isLiveTranscribing = false;
+    
+    // Voice Activity Detection parameters
+    private static final double SILENCE_THRESHOLD_DB = -35.0; // Threshold for silence detection
+    private static final double MIN_ENERGY_THRESHOLD = 0.01; // Minimum energy level for voice activity
+    private static final double LOG10_BASE = Math.log(10.0); // Pre-calculate for performance
+    private static final double MIN_SAMPLE_VALUE = 1e-10; // Avoid log(0)
+    
+    // Performance optimization variables
+    private long lastSilenceLogTime = 0; // For limiting silence log frequency
+    private long lastVoiceDetectedTime = 0; // For UI update throttling
+    private long lastUIUpdateTime = 0; // For status update throttling
+    private boolean isCurrentlyShowingVoice = false; // To avoid redundant UI updates
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -176,6 +190,18 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        // Implementation of live transcribe button functionality
+        btnLiveTranscribe = findViewById(R.id.btnLiveTranscribe);
+        btnLiveTranscribe.setOnClickListener(v -> {
+            if (isLiveTranscribing) {
+                Log.d(TAG, "Stopping live transcription...");
+                stopLiveTranscription();
+            } else {
+                Log.d(TAG, "Starting live transcription...");
+                startLiveTranscription();
+            }
+        });
+
         tvStatus = findViewById(R.id.tvStatus);
         tvResult = findViewById(R.id.tvResult);
         fabCopy = findViewById(R.id.fabCopy);
@@ -207,7 +233,16 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onDataReceived(float[] samples) {
-//                mWhisper.writeBuffer(samples);
+                // Early exit if not in live transcription mode
+                if (!isLiveTranscribing || mWhisper == null) {
+                    return;
+                }
+                
+                // Perform VAD and send to transcription if voice detected
+                if (isVoiceDetected(samples)) {
+                    mWhisper.writeBuffer(samples);
+                }
+                // UI updates for silence are handled in updateUIForSilence()
             }
         });
 
@@ -230,6 +265,26 @@ public class MainActivity extends AppCompatActivity {
 
         // for debugging
 //        testParallelProcessing();
+    }
+    
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Stop live transcription when app goes to background to save battery
+        if (isLiveTranscribing) {
+            Log.d(TAG, "App paused - stopping live transcription");
+            stopLiveTranscription();
+        }
+    }
+    
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        // Clean up resources
+        if (isLiveTranscribing) {
+            stopLiveTranscription();
+        }
+        deinitModel();
     }
 
     // Model initialization
@@ -342,6 +397,141 @@ public class MainActivity extends AppCompatActivity {
 
     private void stopTranscription() {
         mWhisper.stop();
+    }
+
+    // Live transcription calls
+    private void startLiveTranscription() {
+        checkRecordPermission();
+        
+        // Initialize model if not already done
+        if (mWhisper == null) {
+            initModel(selectedTfliteFile);
+        }
+        
+        // Set up for live transcription
+        mWhisper.setAction(Whisper.ACTION_LIVE_TRANSCRIBE);
+        mWhisper.start();
+        
+        // Start recording for live input
+        File waveFile = new File(sdcardDataFolder, WaveUtil.RECORDING_FILE);
+        mRecorder.setFilePath(waveFile.getAbsolutePath());
+        mRecorder.start();
+        
+        isLiveTranscribing = true;
+        handler.post(() -> {
+            btnLiveTranscribe.setText(R.string.stop_live_transcribe);
+            tvStatus.setText("🎧 Listening for speech...");
+            tvResult.setText(""); // Clear previous results
+        });
+    }
+    
+    private void stopLiveTranscription() {
+        try {
+            // Reset state first to prevent new processing
+            isLiveTranscribing = false;
+            
+            // Reset UI state tracking
+            isCurrentlyShowingVoice = false;
+            lastVoiceDetectedTime = 0;
+            lastSilenceLogTime = 0;
+            lastUIUpdateTime = 0;
+            
+            // Stop recorder safely
+            if (mRecorder != null && mRecorder.isInProgress()) {
+                mRecorder.stop();
+            }
+            
+            // Stop whisper safely
+            if (mWhisper != null) {
+                mWhisper.stop();
+            }
+            
+            // Update UI on main thread
+            handler.post(() -> {
+                btnLiveTranscribe.setText(R.string.live_transcribe);
+                tvStatus.setText("Live transcription stopped");
+            });
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Error stopping live transcription", e);
+            // Ensure UI is updated even if errors occur
+            handler.post(() -> {
+                btnLiveTranscribe.setText(R.string.live_transcribe);
+                tvStatus.setText("Error stopping transcription");
+            });
+        }
+    }
+    
+    // Voice Activity Detection method - Optimized for production
+    private boolean isVoiceDetected(float[] samples) {
+        if (samples == null || samples.length == 0) {
+            return false;
+        }
+        
+        // Fast energy calculation with early exit
+        double sumSquares = 0.0;
+        int sampleCount = samples.length;
+        
+        // Optimize: Process in chunks for better cache locality
+        for (int i = 0; i < sampleCount; i++) {
+            float sample = samples[i];
+            sumSquares += sample * sample;
+        }
+        
+        double rmsEnergy = Math.sqrt(sumSquares / sampleCount);
+        
+        // Early exit: Check energy threshold first (cheaper than dB calculation)
+        if (rmsEnergy <= MIN_ENERGY_THRESHOLD) {
+            updateUIForSilence();
+            return false;
+        }
+        
+        // Only calculate dB if energy threshold passed
+        double dB = 20.0 * Math.log(Math.max(rmsEnergy, MIN_SAMPLE_VALUE)) / LOG10_BASE;
+        boolean voiceDetected = dB > SILENCE_THRESHOLD_DB;
+        
+        if (voiceDetected) {
+            updateUIForVoice(rmsEnergy, dB);
+        } else {
+            updateUIForSilence();
+        }
+        
+        return voiceDetected;
+    }
+    
+    // Optimized UI updates with throttling
+    private void updateUIForVoice(double rmsEnergy, double dB) {
+        long currentTime = System.currentTimeMillis();
+        
+        // Throttle logging to once per second
+        if (currentTime - lastVoiceDetectedTime > 1000) {
+            Log.d(TAG, String.format("Voice: RMS=%.4f, dB=%.1f", rmsEnergy, dB));
+            lastVoiceDetectedTime = currentTime;
+        }
+        
+        // Update UI only if not already showing voice (avoid redundant updates)
+        if (!isCurrentlyShowingVoice || currentTime - lastUIUpdateTime > 2000) {
+            handler.post(() -> tvStatus.setText("🎤 Voice detected - transcribing..."));
+            isCurrentlyShowingVoice = true;
+            lastUIUpdateTime = currentTime;
+        }
+    }
+    
+    private void updateUIForSilence() {
+        long currentTime = System.currentTimeMillis();
+        
+        // Throttle silence logging to every 5 seconds
+        if (currentTime - lastSilenceLogTime > 5000) {
+            Log.v(TAG, "Silence detected - skipping transcription");
+            lastSilenceLogTime = currentTime;
+        }
+        
+        // Update UI back to listening state (throttled)
+        if (isCurrentlyShowingVoice && currentTime - lastUIUpdateTime > 3000) {
+            handler.post(() -> tvStatus.setText("🎧 Listening for speech..."));
+            isCurrentlyShowingVoice = false;
+            lastUIUpdateTime = currentTime;
+        }
     }
 
     // Copy assets with specified extensions to destination folder
